@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "wasmworker"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "futures",
  "js-sys",
@@ -585,13 +585,12 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasmworker",
- "wasmworker-proc-macro",
  "web-sys",
 ]
 
 [[package]]
 name = "wasmworker-proc-macro"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "log",
  "quote",
@@ -603,11 +602,11 @@ name = "wasmworker-test"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "js-sys",
  "serde",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasmworker",
- "wasmworker-proc-macro",
  "web-sys",
 ]
 

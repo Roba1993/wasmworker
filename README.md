@@ -1,4 +1,11 @@
 # wasmworker
+
+[![Crates.io](https://img.shields.io/crates/v/wasmworker)](https://crates.io/crates/wasmworker)
+[![docs.rs](https://img.shields.io/docsrs/wasmworker)](https://docs.rs/wasmworker)
+[![CI](https://github.com/paberr/wasmworker/actions/workflows/test.yml/badge.svg)](https://github.com/paberr/wasmworker/actions/workflows/test.yml)
+[![Crates.io Downloads](https://img.shields.io/crates/d/wasmworker)](https://crates.io/crates/wasmworker)
+[![License](https://img.shields.io/crates/l/wasmworker)](https://github.com/paberr/wasmworker#license)
+
 `wasmworker` is a library that provides easy access to parallelization on web targets when compiled to WebAssembly using [wasm-bindgen](https://github.com/rustwasm/wasm-bindgen).
 In contrast to many other libraries like [wasm-bindgen-rayon](https://github.com/RReverser/wasm-bindgen-rayon), this library does not require SharedArrayBuffer support.
 
@@ -10,20 +17,18 @@ In contrast to many other libraries like [wasm-bindgen-rayon](https://github.com
     - [Iterator extension](#iterator-extension)
     - [Async functions with channels](#async-functions-with-channels)
   - [Bundler support (Vite)](#bundler-support-vite)
+  - [Idle timeout](#idle-timeout)
 - [FAQ](#faq)
 
 ## Usage
-The library consists of two crates:
-- `wasmworker`: The main crate that also offers access to the webworker, as well as the worker pool and iterator extensions.
-- `wasmworker-proc-macro`: This crate is needed to expose functions towards the web workers via the `#[webworker_fn]` macro.
 
 ### Setting up
-To use this library, include both dependencies to your `Cargo.toml`.
+To use this library, add the following dependency to your `Cargo.toml`.
+Enable the `macros` feature to get access to the `#[webworker_fn]` and `#[webworker_channel_fn]` attribute macros.
 
 ```toml
 [dependencies]
-wasmworker = "0.2"
-wasmworker-proc-macro = "0.2"
+wasmworker = { version = "0.3", features = ["macros"] }
 ```
 
 The `wasmworker` crate comes with a default feature called `serde`, which allows running any function on a web worker under the following two conditions:
@@ -35,7 +40,7 @@ This is useful for users that do not want a direct serde dependency. Internally,
 
 You can then start using the library without further setup.
 If you plan on using the global `WebWorkerPool` (using the iterator extensions or `worker_pool()`), you can *optionally* configure this pool:
-```rust,no_run
+```rust
 // Importing it publicly will also expose the function on the JavaScript side.
 // You can instantiate the pool both via Rust and JS.
 pub use wasmworker::{init_worker_pool, WorkerPoolOptions};
@@ -45,7 +50,6 @@ async fn startup() {
     options.num_workers = Some(2); // Default is navigator.hardwareConcurrency
     init_worker_pool(options).await.expect("Worker pool already initialized");
 }
-# fn main() {}
 ```
 
 ### Outsourcing tasks
@@ -55,11 +59,12 @@ The library offers three ways of outsourcing function calls onto concurrent work
 3. `par_map`: an extension to regular iterators, which allows to execute a function on every element of the iterator in parallel using the default worker pool.
 
 All approaches require the functions that should be executed to be annotated with the `#[webworker_fn]` macro.
-This macro ensures that the functions are available to the web worker instances:
+This macro ensures that the functions are available to the web worker instances.
+To execute such a function, pass its `WebWorkerFn` handle (obtained via the `webworker!()` macro) to a worker:
 
-```rust,no_run
+```rust
 use serde::{Deserialize, Serialize};
-use wasmworker_proc_macro::webworker_fn;
+use wasmworker::{webworker, webworker_fn};
 
 /// An arbitrary type that is (de)serializable.
 #[derive(Serialize, Deserialize)]
@@ -71,43 +76,29 @@ pub fn sort_vec(mut v: VecType) -> VecType {
     v.0.sort();
     v
 }
-# fn main() {}
-```
 
-Whenever we want to execute a function, we need to pass the corresponding `WebWorkerFn` object to the worker.
-This object describes the function to the worker and can be safely obtained via the `webworker!()` macro:
-
-```rust,no_run
-# use serde::{Deserialize, Serialize};
-# use wasmworker_proc_macro::webworker_fn;
-# #[derive(Serialize, Deserialize)]
-# pub struct VecType(Vec<u8>);
-# #[webworker_fn]
-# pub fn sort_vec(mut v: VecType) -> VecType { v.0.sort(); v }
-use wasmworker::webworker;
-
-# fn main() {
+// Obtain a type-safe handle to the function:
 let ww_sort = webworker!(sort_vec);
-# }
 ```
 
 #### WebWorker
 We can instantiate our own workers and run functions on them:
-```rust,no_run
-# use serde::{Deserialize, Serialize};
-# use wasmworker_proc_macro::webworker_fn;
-# #[derive(Serialize, Deserialize, PartialEq, Debug)]
-# pub struct VecType(Vec<u8>);
-# #[webworker_fn]
-# pub fn sort_vec(mut v: VecType) -> VecType { v.0.sort(); v }
-use wasmworker::{webworker, WebWorker};
+```rust
+use serde::{Deserialize, Serialize};
+use wasmworker::{webworker, webworker_fn, WebWorker};
 
-# async fn example() {
+#[derive(Serialize, Deserialize)]
+pub struct VecType(Vec<u8>);
+
+#[webworker_fn]
+pub fn sort_vec(mut v: VecType) -> VecType {
+    v.0.sort();
+    v
+}
+
 let worker = WebWorker::new(None).await.expect("Couldn't create worker");
-let res = worker.run(webworker!(sort_vec), &VecType(vec![5, 2, 8])).await;
-assert_eq!(res.0, vec![2, 5, 8]);
-# }
-# fn main() {}
+let sorted = worker.run(webworker!(sort_vec), &VecType(vec![3, 1, 2])).await;
+assert_eq!(sorted.0, vec![1, 2, 3]);
 ```
 
 #### WebWorkerPool
@@ -115,21 +106,22 @@ Most of the time, we probably want to schedule tasks to a pool of workers, thoug
 The default worker pool is instantiated on first use and can be configured using `init_worker_pool()` as described above.
 It uses a round-robin scheduler (with the second option being a load based scheduler), a number of `navigator.hardwareConcurrency` separate workers, and the default inferred path.
 
-```rust,no_run
-# use serde::{Deserialize, Serialize};
-# use wasmworker_proc_macro::webworker_fn;
-# #[derive(Serialize, Deserialize, PartialEq, Debug)]
-# pub struct VecType(Vec<u8>);
-# #[webworker_fn]
-# pub fn sort_vec(mut v: VecType) -> VecType { v.0.sort(); v }
-use wasmworker::{webworker, worker_pool};
+```rust
+use serde::{Deserialize, Serialize};
+use wasmworker::{webworker, webworker_fn, worker_pool};
 
-# async fn example() {
+#[derive(Serialize, Deserialize)]
+pub struct VecType(Vec<u8>);
+
+#[webworker_fn]
+pub fn sort_vec(mut v: VecType) -> VecType {
+    v.0.sort();
+    v
+}
+
 let worker_pool = worker_pool().await;
-let res = worker_pool.run(webworker!(sort_vec), &VecType(vec![5, 2, 8])).await;
-assert_eq!(res.0, vec![2, 5, 8]);
-# }
-# fn main() {}
+let sorted = worker_pool.run(webworker!(sort_vec), &VecType(vec![3, 1, 2])).await;
+assert_eq!(sorted.0, vec![1, 2, 3]);
 ```
 
 #### Iterator extension
@@ -153,7 +145,7 @@ First, define an async function with the `#[webworker_channel_fn]` macro:
 
 ```rust,ignore
 use wasmworker::Channel;
-use wasmworker_proc_macro::webworker_channel_fn;
+use wasmworker::webworker_channel_fn;
 
 #[derive(Serialize, Deserialize)]
 pub struct Progress { pub percent: u8 }
@@ -245,35 +237,42 @@ No Rust-side changes are needed — `import.meta.url` resolves correctly when th
 If your build setup places the wasm-bindgen glue or WASM binary at non-standard locations
 (e.g., hashed filenames, nested directories), you can override the paths explicitly:
 
-```rust,no_run
+```rust
 use wasmworker::{init_worker_pool, WorkerPoolOptions};
 
-# async fn example() -> Result<(), wasmworker::AlreadyInitialized> {
 let mut options = WorkerPoolOptions::new();
 // Path to the wasm-bindgen glue file (used by worker blob's import())
 options.path = Some("/assets/myapp.js".to_string());
 // Path to the WASM binary (passed to wasm-bindgen's init function)
 options.path_bg = Some("/assets/myapp_bg.wasm".to_string());
-init_worker_pool(options).await?;
-# Ok(())
-# }
-# fn main() {}
+init_worker_pool(options).await.unwrap();
 ```
 
 #### Precompiling WASM
 
 To reduce bandwidth (fetch WASM once instead of once per worker), you can precompile and share the module:
 
-```rust,no_run
-# use wasmworker::{init_worker_pool, WorkerPoolOptions};
-# async fn example() -> Result<(), wasmworker::AlreadyInitialized> {
+```rust
+use wasmworker::{init_worker_pool, WorkerPoolOptions};
+
 let mut options = WorkerPoolOptions::new();
 options.precompile_wasm = Some(true);
-init_worker_pool(options).await?;
-# Ok(())
-# }
-# fn main() {}
+init_worker_pool(options).await.unwrap();
 ```
+
+### Idle timeout
+
+Workers can be automatically terminated after a period of inactivity and transparently recreated when new tasks arrive. This is useful for freeing resources in applications where worker usage is intermittent:
+
+```rust
+use wasmworker::{init_worker_pool, WorkerPoolOptions};
+
+let mut options = WorkerPoolOptions::new();
+options.idle_timeout_ms = Some(5000); // Terminate idle workers after 5 seconds
+init_worker_pool(options).await.unwrap();
+```
+
+You can inspect the pool state using `num_active_workers()` to see how many workers are currently alive.
 
 ## FAQ
 1. _Why would you not want to use SharedArrayBuffers?_
