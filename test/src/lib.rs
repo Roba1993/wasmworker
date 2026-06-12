@@ -38,7 +38,11 @@ pub async fn run_tests() {
     // Channel tests
     can_use_channel_with_worker().await;
     can_cancel_channel_task().await;
+    channel_task_reports_worker_termination().await;
     can_use_channel_with_pool().await;
+    channel_task_exclusively_leases_worker().await;
+    terminating_channel_task_replaces_worker().await;
+    dropping_channel_task_replaces_worker().await;
 
     // Pool configuration tests
     can_use_precompiled_wasm().await;
