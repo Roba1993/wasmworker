@@ -1,7 +1,12 @@
-use std::marker::PhantomData;
+use std::{
+    cell::{Cell, RefCell},
+    marker::PhantomData,
+    rc::Rc,
+};
 
+use futures::{future::select, pin_mut};
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::{channel::Channel, convert::from_bytes, error::TaskError};
 
@@ -31,9 +36,68 @@ type LifecycleCallback = Box<dyn FnOnce()>;
 pub struct ChannelTask<R> {
     channel: Channel,
     result_rx: Option<oneshot::Receiver<Vec<u8>>>,
+    control: ChannelTaskControl,
     on_complete: Option<LifecycleCallback>,
-    on_terminate: Option<LifecycleCallback>,
     _phantom: PhantomData<R>,
+}
+
+/// A cloneable handle for terminating a running [`ChannelTask`].
+#[derive(Clone)]
+pub struct ChannelTaskControl {
+    inner: Rc<ChannelTaskControlInner>,
+}
+
+struct ChannelTaskControlInner {
+    terminated: Cell<bool>,
+    on_terminate: RefCell<Option<LifecycleCallback>>,
+    close_tx: watch::Sender<bool>,
+}
+
+impl ChannelTaskControl {
+    fn new(on_terminate: Option<LifecycleCallback>) -> Self {
+        let (close_tx, _) = watch::channel(false);
+        Self {
+            inner: Rc::new(ChannelTaskControlInner {
+                terminated: Cell::new(false),
+                on_terminate: RefCell::new(on_terminate),
+                close_tx,
+            }),
+        }
+    }
+
+    /// Terminate the worker running the associated channel task.
+    ///
+    /// Repeated calls are harmless.
+    pub fn terminate(&self) {
+        if self.inner.terminated.replace(true) {
+            return;
+        }
+
+        let _ = self.inner.close_tx.send(true);
+        if let Some(callback) = self.inner.on_terminate.borrow_mut().take() {
+            callback();
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.inner.close_tx.subscribe()
+    }
+
+    fn is_terminated(&self) -> bool {
+        self.inner.terminated.get()
+    }
+
+    fn is_armed(&self) -> bool {
+        self.inner.on_terminate.borrow().is_some()
+    }
+
+    fn disarm(&self) {
+        self.inner.on_terminate.borrow_mut().take();
+    }
+
+    fn set_on_terminate(&self, callback: LifecycleCallback) {
+        *self.inner.on_terminate.borrow_mut() = Some(callback);
+    }
 }
 
 impl<R: DeserializeOwned> ChannelTask<R> {
@@ -53,8 +117,8 @@ impl<R: DeserializeOwned> ChannelTask<R> {
         Self {
             channel,
             result_rx: Some(result_rx),
+            control: ChannelTaskControl::new(on_terminate),
             on_complete,
-            on_terminate,
             _phantom: PhantomData,
         }
     }
@@ -65,23 +129,40 @@ impl<R: DeserializeOwned> ChannelTask<R> {
         on_terminate: LifecycleCallback,
     ) -> Self {
         self.on_complete = Some(on_complete);
-        self.on_terminate = Some(on_terminate);
+        self.control.set_on_terminate(on_terminate);
         self
+    }
+
+    /// Return a cloneable controller that can terminate this task externally.
+    pub fn control(&self) -> ChannelTaskControl {
+        self.control.clone()
     }
 
     /// Receive the next deserialized message from the worker.
     ///
-    /// Returns `None` if the channel's sender side has been dropped
-    /// (i.e., the worker has finished and closed the channel).
+    /// Returns `None` if the channel closes or the task is terminated.
     pub async fn recv<T: DeserializeOwned>(&self) -> Option<T> {
-        self.channel.recv().await
+        let bytes = self.recv_bytes().await?;
+        Some(from_bytes(&bytes))
     }
 
     /// Receive raw bytes from the worker.
     ///
-    /// Returns `None` if the channel's sender side has been dropped.
+    /// Returns `None` if the channel closes or the task is terminated.
     pub async fn recv_bytes(&self) -> Option<Box<[u8]>> {
-        self.channel.recv_bytes().await
+        if self.control.is_terminated() {
+            return None;
+        }
+
+        let mut close_rx = self.control.subscribe();
+        let message = self.channel.recv_bytes();
+        let closed = close_rx.changed();
+        pin_mut!(message, closed);
+
+        match select(message, closed).await {
+            futures::future::Either::Left((message, _)) if !self.control.is_terminated() => message,
+            _ => None,
+        }
     }
 
     /// Send a serialized message to the worker.
@@ -103,18 +184,16 @@ impl<R: DeserializeOwned> ChannelTask<R> {
         let result = result_rx.await.map_err(|_| TaskError::WorkerTerminated);
 
         match result {
-            Ok(bytes) => {
-                self.on_terminate.take();
+            Ok(bytes) if !self.control.is_terminated() => {
+                self.control.disarm();
                 if let Some(on_complete) = self.on_complete.take() {
                     on_complete();
                 }
                 Ok(from_bytes(&bytes))
             }
-            Err(error) => {
-                if let Some(on_terminate) = self.on_terminate.take() {
-                    on_terminate();
-                }
-                Err(error)
+            Ok(_) | Err(_) => {
+                self.control.terminate();
+                Err(TaskError::WorkerTerminated)
             }
         }
     }
@@ -123,17 +202,15 @@ impl<R: DeserializeOwned> ChannelTask<R> {
     ///
     /// Pool tasks exclusively lease their worker. The pool replaces the terminated
     /// worker in the same slot before making that slot schedulable again.
-    pub fn terminate(mut self) {
-        if let Some(on_terminate) = self.on_terminate.take() {
-            on_terminate();
-        }
+    pub fn terminate(&self) {
+        self.control.terminate();
     }
 }
 
 impl<R> Drop for ChannelTask<R> {
     fn drop(&mut self) {
-        if let Some(on_terminate) = self.on_terminate.take() {
-            on_terminate();
+        if self.control.is_armed() {
+            self.control.terminate();
         }
     }
 }

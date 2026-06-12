@@ -145,6 +145,68 @@ pub(crate) async fn channel_task_reports_worker_termination() {
     );
 }
 
+/// Test that external termination wakes a task blocked in recv().
+pub(crate) async fn external_termination_wakes_channel_recv() {
+    let pool = WebWorkerPool::with_num_workers(1)
+        .await
+        .expect("Couldn't create worker pool");
+    let data = vec![1, 2, 3, 4];
+    let task = pool
+        .run_channel(webworker_channel!(process_with_progress), &data)
+        .await;
+    let _: Progress = task.recv().await.expect("Should receive progress");
+    let control = task.control();
+
+    let recv_woke = std::rc::Rc::new(std::cell::Cell::new(false));
+    let recv_woke_task = std::rc::Rc::clone(&recv_woke);
+    wasm_bindgen_futures::spawn_local(async move {
+        recv_woke_task.set(task.recv::<Progress>().await.is_none());
+    });
+
+    sleep_ms(10).await;
+    control.terminate();
+    while !recv_woke.get() {
+        sleep_ms(10).await;
+    }
+
+    let input: Box<[u8]> = vec![3, 1, 2].into();
+    let sorted = pool.run_bytes(webworker!(sort), &input).await;
+    js_assert_eq!(sorted, Box::<[u8]>::from([1, 2, 3]));
+}
+
+/// Test that external termination wakes a task blocked in result().
+pub(crate) async fn external_termination_wakes_channel_result() {
+    let pool = WebWorkerPool::with_num_workers(1)
+        .await
+        .expect("Couldn't create worker pool");
+    let data = vec![1, 2, 3, 4];
+    let task = pool
+        .run_channel(webworker_channel!(process_with_progress), &data)
+        .await;
+    let _: Progress = task.recv().await.expect("Should receive progress");
+    let control = task.control();
+
+    let result_woke = std::rc::Rc::new(std::cell::Cell::new(false));
+    let result_woke_task = std::rc::Rc::clone(&result_woke);
+    wasm_bindgen_futures::spawn_local(async move {
+        result_woke_task.set(matches!(
+            task.result().await,
+            Err(TaskError::WorkerTerminated)
+        ));
+    });
+
+    sleep_ms(10).await;
+    control.terminate();
+    control.terminate();
+    while !result_woke.get() {
+        sleep_ms(10).await;
+    }
+
+    let input: Box<[u8]> = vec![3, 1, 2].into();
+    let sorted = pool.run_bytes(webworker!(sort), &input).await;
+    js_assert_eq!(sorted, Box::<[u8]>::from([1, 2, 3]));
+}
+
 /// Test that channel functions work with the worker pool.
 pub(crate) async fn can_use_channel_with_pool() {
     let pool = worker_pool().await;
@@ -172,6 +234,29 @@ pub(crate) async fn can_use_channel_with_pool() {
     let result = task.result().await.expect("Channel task should succeed");
     js_assert_eq!(result.items_processed, 4, "Should process all items");
     js_assert_eq!(result.was_cancelled, false, "Should not be cancelled");
+}
+
+/// Test that successful completion disarms termination before dropping the task.
+pub(crate) async fn successful_channel_result_keeps_worker_active() {
+    let pool = WebWorkerPool::with_num_workers(1)
+        .await
+        .expect("Couldn't create worker pool");
+    let data = vec![1, 2, 3, 4];
+    let task = pool
+        .run_channel(webworker_channel!(process_with_progress), &data)
+        .await;
+    let _: Progress = task.recv().await.expect("Should receive progress");
+    task.send(&Continue {
+        should_continue: true,
+    });
+    let _: Progress = task.recv().await.expect("Should receive final progress");
+    let _ = task.result().await.expect("Channel task should succeed");
+
+    js_assert_eq!(
+        pool.num_active_workers(),
+        1,
+        "Successful completion should not terminate its worker"
+    );
 }
 
 /// Test that a pool channel task exclusively leases its worker.
@@ -234,12 +319,16 @@ pub(crate) async fn terminating_channel_task_replaces_worker() {
         .await;
     let _: Progress = task.recv().await.expect("Should receive progress");
 
-    task.terminate();
+    let control = task.control();
+    control.terminate();
+    control.terminate();
     js_assert_eq!(
         pool.num_active_workers(),
         0,
         "Terminated slot should not be schedulable during replacement"
     );
+    let was_terminated = matches!(task.result().await, Err(TaskError::WorkerTerminated));
+    js_assert_eq!(was_terminated, true);
 
     let input: Box<[u8]> = vec![3, 1, 2].into();
     let sorted = pool.run_bytes(webworker!(sort), &input).await;

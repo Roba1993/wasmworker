@@ -204,6 +204,23 @@ task.send(&Continue { should_continue: true });
 let result = task.result().await?;
 ```
 
+To cancel from another future, clone the task controller before moving the task:
+
+```rust,ignore
+let control = task.control();
+wasm_bindgen_futures::spawn_local(async move {
+    while let Some(progress) = task.recv::<Progress>().await {
+        // Handle progress.
+    }
+});
+
+control.terminate();
+```
+
+Termination wakes blocked `recv()` and `recv_bytes()` calls, which return `None`.
+Blocked `result()` calls return `TaskError::WorkerTerminated`. Repeated calls to
+`terminate()` are harmless.
+
 Pool channel tasks exclusively lease one worker until `result()` completes. Calling
 `terminate()`, or dropping an unfinished task, terminates that worker and replaces it
 in the same pool slot. The slot is unavailable to the scheduler until its replacement
